@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import Artplayer from 'artplayer';
 import Hls, { type HlsConfig } from 'hls.js';
+import artplayerPluginDanmuku from 'artplayer-plugin-danmuku';
 
 import { PlaybackRecovery, describeHlsError } from '@/lib/playback-recovery';
 import { createHlsLoader } from '@/lib/hls-loader';
@@ -12,6 +13,7 @@ import {
 } from '@/lib/video-prefetcher';
 import { loadCacheSettings } from '@/lib/video-cache';
 import { formatTime } from '@/lib/utils';
+import { fetchDanmuComments, cleanTitle } from '@/lib/danmu';
 import { prefersTouchPointer } from '@/lib/touch-pointer';
 import {
   findActiveSegment,
@@ -76,6 +78,8 @@ interface PlayerShellProps {
   onRecordSegment?: (segment: SkipSegment) => void;
   /** 剧集标识 `${source}:${vodId}:${episodeIndex}`（片段缓存按集淘汰的分组键） */
   episodeKey?: string;
+  /** 弹幕匹配用：当前集数（从 1 开始） */
+  episode?: number;
   /** 下一集 m3u8 地址：当前集预取完成后预热下一集前 7 分钟 */
   nextUrl?: string;
   nextEpisodeKey?: string;
@@ -111,6 +115,7 @@ export function PlayerShell({
   onPlayerApi,
   onRecordSegment,
   episodeKey,
+  episode,
   nextUrl,
   nextEpisodeKey,
   getRestorePosition,
@@ -127,6 +132,10 @@ export function PlayerShell({
   const containerRef = useRef<HTMLDivElement>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const artRef = useRef<any>(null);
+  // 弹幕插件实例（工厂函数返回的对象，load/show/hide 都在它身上）
+  const danmukuRef = useRef<ReturnType<ReturnType<typeof artplayerPluginDanmuku>> | null>(null);
+  // 弹幕开关状态
+  const danmuOnRef = useRef(true);
   const hlsRef = useRef<Hls | null>(null);
   const [error, setError] = useState('');
   const [hint, setHint] = useState('');
@@ -138,14 +147,14 @@ export function PlayerShell({
   const propsRef = useRef({
     url, title, adFilter, autoplayNext, skipMark, autoSkipSegments,
     pendingStart, onPendingStart, onPlayerApi, onRecordSegment,
-    episodeKey, nextUrl, nextEpisodeKey,
+    episodeKey, episode, nextUrl, nextEpisodeKey,
     getRestorePosition, onTimeUpdate, onEnded, onPause, onQuality, onRequestSwitchSource,
     onPrevEpisode, onNextEpisode, hasPrevEpisode, hasNextEpisode,
   });
   propsRef.current = {
     url, title, adFilter, autoplayNext, skipMark, autoSkipSegments,
     pendingStart, onPendingStart, onPlayerApi, onRecordSegment,
-    episodeKey, nextUrl, nextEpisodeKey,
+    episodeKey, episode, nextUrl, nextEpisodeKey,
     getRestorePosition, onTimeUpdate, onEnded, onPause, onQuality, onRequestSwitchSource,
     onPrevEpisode, onNextEpisode, hasPrevEpisode, hasNextEpisode,
   };
@@ -510,6 +519,26 @@ export function PlayerShell({
 
     let lastSave = 0;
 
+    /**
+     * 弹幕插件：artplayerPluginDanmuku(option) 返回的是 (art) => Result 工厂函数，
+     * 真正的实例（load/show/hide）只在播放器初始化时才产生，故包一层把它捕获到 ref。
+     */
+    const danmukuFactory = artplayerPluginDanmuku({
+      danmuku: [], // 先空，换集时动态 load
+      speed: 5,
+      opacity: 1,
+      fontSize: 22,
+      margin: [4, 25],
+      antiOverlap: true, // 弹幕防重叠
+      synchronousPlayback: true, // 倍速播放时弹幕同步
+      emitter: false, // 未接入发送接口，隐藏输入框避免误导
+    });
+    const danmukuPlugin = (artInstance: Artplayer) => {
+      const instance = danmukuFactory(artInstance);
+      danmukuRef.current = instance;
+      return instance;
+    };
+
     const art = new Artplayer({
       container: containerRef.current,
       url: initialUrl,
@@ -532,6 +561,7 @@ export function PlayerShell({
       hotkey: false,
       theme: '#2563eb',
       lang: navigator.language.toLowerCase().startsWith('zh') ? 'zh-cn' : 'en',
+      plugins: [danmukuPlugin],
       moreVideoAttr: { crossOrigin: 'anonymous', playsInline: true },
       // 上/下集放在播放键右侧：换集是看剧最高频的动作，不该让用户滚回页面下方找按钮
       controls: [
@@ -636,6 +666,22 @@ export function PlayerShell({
     // resize 不在 ArtPlayer 的视频事件转发表里，直接挂原生事件
     art.video?.addEventListener('resize', reportVideoHeight);
 
+    // 弹幕开关（插件自身只注册热度图控件，开关按钮在此补上）
+    art.controls.add({
+      name: 'danmu-switch',
+      position: 'right',
+      index: 10,
+      html: '<span style="font-size:12px;padding:0 3px;line-height:1.2">弹</span>',
+      tooltip: '弹幕开关',
+      click: () => {
+        const dm = danmukuRef.current;
+        if (!dm) return;
+        danmuOnRef.current = !danmuOnRef.current;
+        if (danmuOnRef.current) dm.show();
+        else dm.hide();
+        showHint(danmuOnRef.current ? '弹幕已开启' : '弹幕已关闭');
+      },
+    });
     art.on('video:loadedmetadata', () => {
       // ArtPlayer 运行时支持 title 选项（类型定义未覆盖），用于界面标题展示
       try {
@@ -937,6 +983,7 @@ export function PlayerShell({
       propsRef.current.onPlayerApi?.(null);
       art.destroy();
       artRef.current = null;
+      danmukuRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -980,6 +1027,31 @@ export function PlayerShell({
     if (firstUrlRef.current) { firstUrlRef.current = false; return; }
     loadEpisode(url);
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [url]);
+
+  // —— 弹幕：挂载及换集（url 变化）时重新匹配并加载 ——
+  useEffect(() => {
+    if (!artRef.current || !danmukuRef.current || !propsRef.current.url) return;
+    let cancelled = false;
+    // 先清空上一集弹幕
+    danmukuRef.current.load([]).catch(() => { /* 忽略 */ });
+
+    const { title, episode } = propsRef.current;
+    // 弹幕源聚合需要数秒到十几秒，先给个提示避免用户以为没生效
+    showHint('弹幕加载中...');
+    fetchDanmuComments(cleanTitle(title), episode ?? 1)
+      .then((comments) => {
+        if (cancelled || !danmukuRef.current) return;
+        if (comments.length > 0) {
+          danmukuRef.current.load(comments).catch(() => { /* 忽略 */ });
+          showHint(`已加载 ${comments.length} 条弹幕`);
+        } else {
+          showHint('未匹配到弹幕');
+        }
+      })
+      .catch(() => { /* 静默失败，不影响播放 */ });
+
+    return () => { cancelled = true; };
   }, [url]);
 
   // —— 广告过滤开关变化：重建 HLS loader（无需重建整个播放器） ——
